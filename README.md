@@ -9,7 +9,9 @@ This makes it easy to integrate more naturally into the AMM structure.
 The hook will esentially override the standard AMM pricing with an oracle-based "mark price" and the pool will be used for collateral management.
 
 ### Core Logic
-` _PerpHook_ ` is to have logic in the `beforeSwap` and `afterSwap` function to manage leveraged position
+ _PerpHook_ has logic in the `beforeSwap` and `afterSwap` function to manage leveraged position. These utilise the v4's flash accounting mechanism for effecient movement of collateral and fees respresented the `int256` return deltas/values
+
+ The hook uses **GMX V2's pricing**. Thus the pricing mechanism is external `oracle.getMarkPrice`, thus the pool's internal concentrated liquidity curve is used only to manage reserves/collateral but not to set the trading price.
 
 
 
