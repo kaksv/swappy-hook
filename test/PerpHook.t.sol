@@ -19,6 +19,7 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PerpHook, Position} from "../src/PerpHook.sol";
 import {MockChainlinkPriceFeed, MockOracleAdapter} from "./mocks/MockOracle.sol";
 import {IChainlinkPriceFeed} from "../src/interfaces/IChainlinkPriceFeed.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 contract PerpHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
@@ -142,13 +143,21 @@ contract PerpHookTest is Test, Deployers {
     function _openLongPosition(address trader, uint128 collateralAmount, int128 positionSize) internal {
         bytes memory hookData = abi.encode(trader, positionSize);
 
+        // Get current pool price to set appropriate limit using StateLibrary
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        // Use a price limit that's far enough from current price but not at absolute max
+        // For zeroForOne=false (price going up), we need limit > current price
+        uint160 priceLimit = sqrtPriceX96 < TickMath.MAX_SQRT_PRICE - 1e20 
+            ? sqrtPriceX96 + 1e20  // Move price up by a reasonable amount
+            : TickMath.MAX_SQRT_PRICE - 1;
+
         vm.prank(trader);
         swapRouter.swap(
             poolKey,
             SwapParams({
                 zeroForOne: false, // false = token1 -> token0 direction (depositing collateral)
                 amountSpecified: -int256(uint256(collateralAmount)), // Negative = exact input of token1
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
@@ -162,13 +171,19 @@ contract PerpHookTest is Test, Deployers {
     function _openShortPosition(address trader, uint128 collateralAmount, int128 positionSize) internal {
         bytes memory hookData = abi.encode(trader, -positionSize); // Negative for short
 
+        // Get current pool price to set appropriate limit using StateLibrary
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        uint160 priceLimit = sqrtPriceX96 < TickMath.MAX_SQRT_PRICE - 1e20 
+            ? sqrtPriceX96 + 1e20
+            : TickMath.MAX_SQRT_PRICE - 1;
+
         vm.prank(trader);
         swapRouter.swap(
             poolKey,
             SwapParams({
                 zeroForOne: false, // false = token1 -> token0 direction (depositing collateral)
                 amountSpecified: -int256(uint256(collateralAmount)), // Negative = exact input of token1
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
@@ -231,7 +246,7 @@ contract PerpHookTest is Test, Deployers {
         uint128 collateral = 50e18; // 50 USDC (insufficient)
         int128 positionSize = 5e18; // 5 tokens
 
-        vm.expectRevert("PERP_HOOK: Margin requirement failed");
+        vm.expectRevert(abi.encodeWithSelector(PerpHook.MarginRequirementFailed.selector));
         _openLongPosition(alice, collateral, positionSize);
     }
 
@@ -254,16 +269,25 @@ contract PerpHookTest is Test, Deployers {
         // First open a position
         _openLongPosition(alice, initialCollateral, positionSize);
 
+        // Get current position to see actual collateral (after fees)
+        Position memory currentPos = _getPosition(alice);
+        
+        // Get current pool price for limit
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        uint160 priceLimit = sqrtPriceX96 > TickMath.MIN_SQRT_PRICE + 1e20
+            ? sqrtPriceX96 - 1e20
+            : TickMath.MIN_SQRT_PRICE + 1;
+
         // Now try to remove more collateral than we have
         bytes memory hookData = abi.encode(alice, int128(0)); // No position change
         vm.prank(alice);
-        vm.expectRevert("PERP_HOOK: Negative collateral");
+        vm.expectRevert(abi.encodeWithSelector(PerpHook.NegativeCollateral.selector));
         swapRouter.swap(
             poolKey,
             SwapParams({
-                zeroForOne: true, // Swapping token0 for token1 (removing collateral)
-                amountSpecified: -int256(uint256(initialCollateral) + 1), // More than we have
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, // Withdrawing collateral (token1 output)
+                amountSpecified: int256(uint256(currentPos.collateral) + 1e18), // More than we have
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
@@ -281,6 +305,12 @@ contract PerpHookTest is Test, Deployers {
         uint128 additionalCollateral = 5000e18;
         int128 additionalSize = 2e18;
 
+        // Get current pool price for limit
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        uint160 priceLimit = sqrtPriceX96 < TickMath.MAX_SQRT_PRICE - 1e20 
+            ? sqrtPriceX96 + 1e20
+            : TickMath.MAX_SQRT_PRICE - 1;
+
         bytes memory hookData = abi.encode(alice, additionalSize);
         vm.prank(alice);
         swapRouter.swap(
@@ -288,7 +318,7 @@ contract PerpHookTest is Test, Deployers {
             SwapParams({
                 zeroForOne: false,
                 amountSpecified: -int256(uint256(additionalCollateral)),
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
@@ -353,6 +383,12 @@ contract PerpHookTest is Test, Deployers {
 
         // Trigger liquidation by performing a swap (this will call afterSwap)
         // Alice needs to do the swap to check alice's position for liquidation
+        // Get current pool price for limit
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        uint160 priceLimit = sqrtPriceX96 > TickMath.MIN_SQRT_PRICE + 1e20
+            ? sqrtPriceX96 - 1e20
+            : TickMath.MIN_SQRT_PRICE + 1;
+
         bytes memory hookData = abi.encode(alice, int128(0)); // No position change
         vm.prank(alice);
         swapRouter.swap(
@@ -360,7 +396,7 @@ contract PerpHookTest is Test, Deployers {
             SwapParams({
                 zeroForOne: true,
                 amountSpecified: -1000, // Small swap to trigger afterSwap
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
@@ -402,6 +438,12 @@ contract PerpHookTest is Test, Deployers {
         priceFeed.setPrice(newPrice8);
 
         // Add more to position at new price
+        // Get current pool price for limit
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        uint160 priceLimit = sqrtPriceX96 < TickMath.MAX_SQRT_PRICE - 1e20 
+            ? sqrtPriceX96 + 1e20
+            : TickMath.MAX_SQRT_PRICE - 1;
+
         bytes memory hookData = abi.encode(alice, int128(1e18));
         vm.prank(alice);
         swapRouter.swap(
@@ -409,7 +451,7 @@ contract PerpHookTest is Test, Deployers {
             SwapParams({
                 zeroForOne: false,
                 amountSpecified: -int256(uint256(5000e18)),
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
@@ -475,13 +517,19 @@ contract PerpHookTest is Test, Deployers {
         int128 closeSize = -positionSize; // Negative to close
         bytes memory hookData = abi.encode(alice, closeSize);
 
+        // Get current pool price for limit (for zeroForOne=true, price goes down)
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolKey.toId());
+        uint160 priceLimit = sqrtPriceX96 > TickMath.MIN_SQRT_PRICE + 1e20
+            ? sqrtPriceX96 - 1e20  // Move price down
+            : TickMath.MIN_SQRT_PRICE + 1;
+
         vm.prank(alice);
         swapRouter.swap(
             poolKey,
             SwapParams({
                 zeroForOne: true,
                 amountSpecified: int256(uint256(collateral)), // Remove all collateral
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                sqrtPriceLimitX96: priceLimit
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
